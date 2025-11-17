@@ -1,5 +1,8 @@
 # custom_nodes/wanhumo_custom_sampler/wanhumo_sampler.py
 import torch
+import os
+WANHUMO_DEBUG = False
+
 import comfy.samplers
 import comfy.sample
 import comfy.utils
@@ -26,25 +29,18 @@ class LatentWrapper(dict):
 
     def to(self, device):
         # Move all tensor values ​​to the specified device and return the new wrapper
-        new = {}
-        for k, v in self.items():
-            try:
-                if isinstance(v, torch.Tensor):
-                    new[k] = v.to(device)
-                elif isinstance(v, list):
-                    # If the list is tensors (for example reference_latents), move the elements
-                    new_list = []
-                    for item in v:
-                        if isinstance(item, torch.Tensor):
-                            new_list.append(item.to(device))
-                        else:
-                            new_list.append(item)
-                    new[k] = new_list
-                else:
-                    new[k] = v
-            except Exception:
-                new[k] = v
-        return LatentWrapper(new)
+        def _move_obj(o):
+            if isinstance(o, torch.Tensor):
+                return o.to(device)
+            if isinstance(o, list):
+                return [_move_obj(x) for x in o]
+            if isinstance(o, tuple):
+                return tuple(_move_obj(x) for x in o)
+            if isinstance(o, dict):
+                return {kk: _move_obj(vv) for kk, vv in o.items()}
+            return o
+
+        return LatentWrapper({k: _move_obj(v) for k, v in self.items()})
 
     def cpu(self):
         return self.to("cpu")
@@ -53,42 +49,14 @@ class LatentWrapper(dict):
         return self.to("cuda")
 
 
-class SimpleLatent:
+class SimpleLatent(LatentWrapper):
+    """
+    Лёгкая обёртка над LatentWrapper для совместимости с существующим кодом.
+    Теперь SimpleLatent наследует правильное поведение (to/cpu/cuda/copy/shape).
+    """
     def __init__(self, latent_dict):
-        self.latent_dict = latent_dict
+        super().__init__(latent_dict)
         self.is_nested = False 
-
-    def __getitem__(self, key):
-        return self.latent_dict[key]
-
-    def get(self, key, default=None):
-        return self.latent_dict.get(key, default)
-    
-    @property
-    def shape(self):
-        # It is necessary that the fragments of this cry out in the middle.
-        return self.latent_dict["samples"].shape
-
-    def copy(self):
-        return SimpleLatent(self.latent_dict.copy())
-    
-    def to(self, device):
-        """Moving latent on device."""
-        new_dict = {}
-        for key, value in self.latent_dict.items():
-            if isinstance(value, torch.Tensor):
-                new_dict[key] = value.to(device)
-            else:
-                new_dict[key] = value
-        return SimpleLatent(new_dict)
-    
-    def cpu(self):
-        """Moving to CPU."""
-        return self.to("cpu")
-    
-    def cuda(self):
-        """Moving to GPU."""
-        return self.to("cuda")
 
 
 # --- MODEL WRAPPER CLASS (WanHuMo_Model_Wrapper) ---
@@ -104,9 +72,25 @@ class WanHuMo_Model_Wrapper:
         self.c_ti = c_ti
         self.c_neg = c_neg
         self.c_neg_null = c_neg_null
-        self.scale_a = scale_a
-        self.scale_t = scale_t
+        # 
+        try:
+            self.scale_a = float(scale_a)
+        except Exception:
+            self.scale_a = scale_a
+        try:
+            self.scale_t = float(scale_t)
+        except Exception:
+            self.scale_t = scale_t
         self.step_change = step_change
+
+        env_debug = False
+        try:
+            env_debug = bool(int(os.environ.get("WANHUMO_DEBUG", "0")))
+        except Exception:
+            env_debug = False
+        self._debug = bool(WANHUMO_DEBUG) or env_debug
+        self._debug_count = 0
+        self._debug_max = 4  
         self._safe_attributes = {'inner_model', 'model', 'load_device', 'offload_device', 'model_type', 
                                  'c_tia', 'c_ti', 'c_neg', 'c_neg_null', 'scale_a', 'scale_t', 'step_change'}
 
@@ -117,24 +101,53 @@ class WanHuMo_Model_Wrapper:
         
     def apply_model(self, x, timestep, c_cond, c_uncond):
         with torch.no_grad():
-            
             def apply_with_cond(cond_list, x, timestep):
                 tokens = cond_list[0][0]
-                extra_params = cond_list[0][1]
+                extra_params = cond_list[0][1] if len(cond_list[0]) > 1 and isinstance(cond_list[0][1], dict) else {}
+                uncond_params = self.c_neg[0][1] if len(self.c_neg[0]) > 1 and isinstance(self.c_neg[0][1], dict) else {}
                 return self.inner_model.apply_model(
-                    x, 
-                    timestep, 
-                    c_cond=tokens, 
-                    c_uncond=self.c_neg[0][0], 
-                    cond_concat=extra_params.get("pooled_output", None), 
-                    uncond_concat=self.c_neg[0][1].get("pooled_output", None)
+                    x,
+                    timestep,
+                    c_cond=tokens,
+                    c_uncond=self.c_neg[0][0],
+                    cond_concat=extra_params.get("pooled_output", None),
+                    uncond_concat=uncond_params.get("pooled_output", None),
                 )
 
             pos_tia_out = apply_with_cond(self.c_tia, x, timestep)
             pos_ti_out = apply_with_cond(self.c_ti, x, timestep)
-            current_t_val = timestep[0].item() 
+
+            # Robust handling of timestep which can be: tensor scalar, float, list/tuple of tensor/float
+            t0 = timestep
+            try:
+                # unpack single-element list/tuple
+                if isinstance(t0, (list, tuple)) and len(t0) == 1:
+                    t0 = t0[0]
+            except Exception:
+                pass
+            if isinstance(t0, torch.Tensor):
+                current_t_raw = float(t0.item())
+            else:
+                current_t_raw = float(t0)
+            num_ts = getattr(self.inner_model, "num_timesteps", None) or getattr(self.inner_model, "num_train_timesteps", None) or 1000
+            current_t_val = int(current_t_raw * num_ts) if current_t_raw <= 1.0 else int(current_t_raw)
+
             current_neg_cond = self.c_neg if current_t_val > self.step_change else self.c_neg_null
             neg_out = apply_with_cond(current_neg_cond, x, timestep)
+
+            # Debug: show basic diagnostics so user can confirm scale_* имеет эффект.
+            if getattr(self.inner_model, "_wanhumo_debug", False) or self._debug:
+                if self._debug_count < self._debug_max:
+                    
+                    try:
+                        d_tia_ti = float((pos_tia_out - pos_ti_out).pow(2).mean().sqrt().item())
+                        d_ti_neg = float((pos_ti_out - neg_out).pow(2).mean().sqrt().item())
+                    except Exception:
+                        d_tia_ti = None
+                        d_ti_neg = None
+                    print(f"[WanHuMo DEBUG] raw_t={current_t_raw:.6f} val={current_t_val} step_change={self.step_change} "
+                          f"scale_a={self.scale_a} scale_t={self.scale_t} d(tia-ti)={d_tia_ti} d(ti-neg)={d_ti_neg}")
+                    self._debug_count += 1
 
             if current_t_val > self.step_change:
                 noise_pred = self.scale_a * (pos_tia_out - pos_ti_out) + self.scale_t * (pos_ti_out - neg_out) + neg_out
@@ -210,10 +223,23 @@ class WanHuMo_Sampler:
         else:
             effective_scale_a = DEFAULT_SCALE_A
             effective_scale_t = DEFAULT_SCALE_T
+
         
-        # 3. Create model wrapper
-        # Try to reuse a previously created wrapper attached to the original model object.
-        # Это позволяет избежать создания нового обёрточного объекта и повторной загрузки модели.
+        try:
+            effective_scale_a = float(effective_scale_a)
+        except Exception:
+            pass
+        try:
+            effective_scale_t = float(effective_scale_t)
+        except Exception:
+            pass
+       
+        try:
+            effective_scale_a = max(0.0, min(8.0, effective_scale_a))
+            effective_scale_t = max(0.0, min(8.0, effective_scale_t))
+        except Exception:
+            pass
+                
         cached_attr = "_wanhumo_wrapper"
         existing = getattr(model, cached_attr, None)
         if existing is None or not isinstance(existing, WanHuMo_Model_Wrapper):
@@ -223,7 +249,6 @@ class WanHuMo_Sampler:
             )
             setattr(model, cached_attr, wrapped_model)
         else:
-            # Переиспользуем обёртку, обновляем поля кондишнинга/параметры (чтобы не создавать новый объект)
             wrapped_model = existing
             wrapped_model.c_tia = c_tia
             wrapped_model.c_ti = c_ti
@@ -232,9 +257,43 @@ class WanHuMo_Sampler:
             wrapped_model.scale_a = effective_scale_a
             wrapped_model.scale_t = effective_scale_t
             wrapped_model.step_change = step_change
-            # убедимся, что inner_model не потерян (на случай реструктуризации)
             wrapped_model.inner_model = model
         
+        # --- NEW: ensure model is placed on same device as latent for sampling ---
+        def _module_device(module):
+            # try to get device from parameters or buffers
+            try:
+                for p in module.parameters():
+                    return p.device
+            except Exception:
+                pass
+            try:
+                for b in module.buffers():
+                    return b.device
+            except Exception:
+                pass
+            return None
+
+        # determine module to inspect/move (prefer wrapper.model, fall back to inner_model)
+        model_module = getattr(wrapped_model, "model", None) or getattr(wrapped_model, "inner_model", None)
+        orig_dev = _module_device(model_module)  # may be None
+        target_dev = latent.device if isinstance(latent, torch.Tensor) else None
+
+        moved_model = False
+        if target_dev is not None and orig_dev is not None and orig_dev != target_dev:
+            try:
+                # try to move the original model object (prefer inner_model.to)
+                if hasattr(wrapped_model, "inner_model") and hasattr(wrapped_model.inner_model, "to"):
+                    wrapped_model.inner_model.to(target_dev)
+                elif hasattr(model_module, "to"):
+                    model_module.to(target_dev)
+                moved_model = True
+                # free CUDA cache to reduce fragmentation
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                moved_model = False
+
         # 4. Handle noise_mask and prepare callback
         noise_mask = None
         if isinstance(latent_image, dict):
@@ -264,6 +323,38 @@ class WanHuMo_Sampler:
             callback=callback, 
             seed=seed,
         )
+
+        # --- NEW: return model to original device if we moved it ---
+        if moved_model:
+            try:
+                # prefer inner_model if present
+                target_module = getattr(wrapped_model, "inner_model", None) or model_module
+                # If original device unknown or CPU-like -> offload explicitly to CPU
+                orig_is_cpu = False
+                try:
+                    orig_is_cpu = orig_dev is None or str(orig_dev).lower().startswith("cpu")
+                except Exception:
+                    orig_is_cpu = False
+
+                if target_module is not None:
+                    try:
+                        if orig_is_cpu:
+                            # try .cpu() first for safer offload
+                            if hasattr(target_module, "cpu"):
+                                target_module.cpu()
+                            elif hasattr(target_module, "to"):
+                                target_module.to("cpu")
+                        else:
+                            if hasattr(target_module, "to"):
+                                target_module.to(orig_dev)
+                    except Exception:
+                        # best-effort, ignore on failure
+                        pass
+                # always try to free CUDA memory after moves
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
         # 6. Build output
         out = {}
