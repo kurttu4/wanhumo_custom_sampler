@@ -1,4 +1,4 @@
-# Файл: custom_nodes/wanhumo_nodes/wanhumo_conditioning.py
+# custom_nodes/wanhumo_nodes/wanhumo_conditioning.py
 import torch
 import comfy.model_management
 import comfy.utils
@@ -8,6 +8,9 @@ import node_helpers
 AUDIO_ENCODER_OUTPUT_TYPE = "AUDIO_ENCODER_OUTPUT" 
 
 class WanHuMo_Conditioning:
+    # Added: node name and description (displayed in UI/documentation)
+    NODE_NAME = "WanHuMo Conditioning"
+    NODE_DESCRIPTION = "Generates conditioning (reference_latents, audio_embed) and adds scale_a / scale_t parameters for subsequent sampling."
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -17,10 +20,10 @@ class WanHuMo_Conditioning:
                 "vae": ("VAE",),
                 "width": ("INT", {"default": 832, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
                 "height": ("INT", {"default": 480, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
-                "length": ("INT", {"default": 97, "min": 1, "max": 2048, "step": 4, "tooltip": "Кількість кадрів відео."}),
+                "length": ("INT", {"default": 97, "min": 1, "max": 2048, "step": 4, "tooltip": "Number of video frames."}),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
-                "scale_a": ("FLOAT", {"default": 5.5, "min": 0.1, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "Audio Guidance Scale (scale_a)"}),
-                "scale_t": ("FLOAT", {"default": 5.0, "min": 0.1, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "Text Guidance Scale (scale_t)"}),
+                "scale_a": ("FLOAT", {"default": 5.5, "min": 0.1, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "Strength of audio guidance. Higher = better audio-motion sync."}),
+                "scale_t": ("FLOAT", {"default": 5.0, "min": 0.1, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "Strength of text guidance. Higher = better adherence to text prompts."}),
             },
             "optional": {
                 "audio_encoder_output": (AUDIO_ENCODER_OUTPUT_TYPE, {"optional": True}),
@@ -49,7 +52,7 @@ class WanHuMo_Conditioning:
             negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [zero_latent]}, append=True)
 
         if audio_encoder_output is not None:
-            # Тут ваш складний код для обробки аудіо
+            # Audio processing code
             audio_emb = torch.stack(audio_encoder_output["encoded_audio_all_layers"], dim=2)
             audio_len = audio_encoder_output["audio_samples"] // 640
             audio_emb = audio_emb[:, :audio_len * 2]
@@ -72,7 +75,7 @@ class WanHuMo_Conditioning:
             positive = node_helpers.conditioning_set_values(positive, {"audio_embed": zero_audio})
             negative = node_helpers.conditioning_set_values(negative, {"audio_embed": zero_audio})
             
-        # ДОДАВАННЯ scale_a та scale_t
+        # Add scale_a and scale_t (pass into conditioning)
         positive = node_helpers.conditioning_set_values(positive, {"scale_a": [scale_a], "scale_t": [scale_t]}, append=True)
         negative = node_helpers.conditioning_set_values(negative, {"scale_a": [scale_a], "scale_t": [scale_t]}, append=True)
         
@@ -80,7 +83,7 @@ class WanHuMo_Conditioning:
         out_latent["samples"] = latent
         return (positive, negative, out_latent)
 
-# ДОПОМІЖНІ ФУНКЦІЇ (як у вашому коді)
+# HELPER FUNCTIONS (as in your code)
 def linear_interpolation(features, input_fps, output_fps, output_len=None):
     features = features.transpose(1, 2)
     seq_len = features.shape[2] / float(input_fps)
