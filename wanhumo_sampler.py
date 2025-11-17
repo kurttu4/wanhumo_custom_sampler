@@ -212,10 +212,28 @@ class WanHuMo_Sampler:
             effective_scale_t = DEFAULT_SCALE_T
         
         # 3. Create model wrapper
-        wrapped_model = WanHuMo_Model_Wrapper(
-            model, 
-            c_tia, c_ti, c_neg, c_neg_null, effective_scale_a, effective_scale_t, step_change
-        )
+        # Try to reuse a previously created wrapper attached to the original model object.
+        # Это позволяет избежать создания нового обёрточного объекта и повторной загрузки модели.
+        cached_attr = "_wanhumo_wrapper"
+        existing = getattr(model, cached_attr, None)
+        if existing is None or not isinstance(existing, WanHuMo_Model_Wrapper):
+            wrapped_model = WanHuMo_Model_Wrapper(
+                model,
+                c_tia, c_ti, c_neg, c_neg_null, effective_scale_a, effective_scale_t, step_change
+            )
+            setattr(model, cached_attr, wrapped_model)
+        else:
+            # Переиспользуем обёртку, обновляем поля кондишнинга/параметры (чтобы не создавать новый объект)
+            wrapped_model = existing
+            wrapped_model.c_tia = c_tia
+            wrapped_model.c_ti = c_ti
+            wrapped_model.c_neg = c_neg
+            wrapped_model.c_neg_null = c_neg_null
+            wrapped_model.scale_a = effective_scale_a
+            wrapped_model.scale_t = effective_scale_t
+            wrapped_model.step_change = step_change
+            # убедимся, что inner_model не потерян (на случай реструктуризации)
+            wrapped_model.inner_model = model
         
         # 4. Handle noise_mask and prepare callback
         noise_mask = None
