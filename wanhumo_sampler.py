@@ -1,4 +1,4 @@
-# Файл: custom_nodes/wanhumo_custom_sampler/wanhumo_sampler.py
+# custom_nodes/wanhumo_custom_sampler/wanhumo_sampler.py
 import torch
 import comfy.samplers
 import comfy.sample
@@ -7,32 +7,32 @@ import latent_preview
 
 
 class LatentWrapper(dict):
-    """Обертка для dict, которая имеет атрибут is_nested и совместимые методы."""
+    """A wrapper for dict that has an is_nested attribute and compatible methods."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.is_nested = False
 
     @property
     def shape(self):
-        # Возвращаем shape тензора samples, если он есть
+        # Return the shape of the samples tensor, if it exists
         samples = self.get("samples", None)
         if hasattr(samples, "shape"):
             return samples.shape
         return None
 
     def copy(self):
-        # Возвращаем ещё одну обёртку поверх копии словаря
+        # Return another wrapper over a copy of the dictionary
         return LatentWrapper(dict(self))
 
     def to(self, device):
-        # Перемещаем все tensor-значения на указанный device и возвращаем новую обёртку
+        # Move all tensor values ​​to the specified device and return the new wrapper
         new = {}
         for k, v in self.items():
             try:
                 if isinstance(v, torch.Tensor):
                     new[k] = v.to(device)
                 elif isinstance(v, list):
-                    # Если список тензоров (например reference_latents), переносим элементы
+                    # If the list is tensors (for example reference_latents), move the elements
                     new_list = []
                     for item in v:
                         if isinstance(item, torch.Tensor):
@@ -66,15 +66,14 @@ class SimpleLatent:
     
     @property
     def shape(self):
-        # Потрібно, оскільки це викликається безпосередньо.
+        # It is necessary that the fragments of this cry out in the middle.
         return self.latent_dict["samples"].shape
 
     def copy(self):
-        # Також потрібен.
         return SimpleLatent(self.latent_dict.copy())
     
     def to(self, device):
-        """Переміщення latent на пристрій."""
+        """Moving latent on device."""
         new_dict = {}
         for key, value in self.latent_dict.items():
             if isinstance(value, torch.Tensor):
@@ -84,15 +83,15 @@ class SimpleLatent:
         return SimpleLatent(new_dict)
     
     def cpu(self):
-        """Переміщення на CPU."""
+        """Moving to CPU."""
         return self.to("cpu")
     
     def cuda(self):
-        """Переміщення на GPU."""
+        """Moving to GPU."""
         return self.to("cuda")
 
 
-# --- КЛАС-ОБГОРТКА МОДЕЛІ (WanHuMo_Model_Wrapper) ---
+# --- MODEL WRAPPER CLASS (WanHuMo_Model_Wrapper) ---
 class WanHuMo_Model_Wrapper:
     def __init__(self, original_model, c_tia, c_ti, c_neg, c_neg_null, scale_a, scale_t, step_change):
         
@@ -117,7 +116,6 @@ class WanHuMo_Model_Wrapper:
         return getattr(self.inner_model, name)
         
     def apply_model(self, x, timestep, c_cond, c_uncond):
-        
         with torch.no_grad():
             
             def apply_with_cond(cond_list, x, timestep):
@@ -146,8 +144,11 @@ class WanHuMo_Model_Wrapper:
             return noise_pred
 
 
-# Клас WanHuMo_Sampler
+# WanHuMo Sampler node
 class WanHuMo_Sampler:
+    # Added: friendly node name and description (shown in UI/documentation)
+    NODE_NAME = "WanHuMo Sampler"
+    NODE_DESCRIPTION = "WanHuMo specialized sampler: combines audio/text conditioning and manages CFG switching via step_change and scale_a/scale_t."
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -161,7 +162,8 @@ class WanHuMo_Sampler:
                 "negative": ("CONDITIONING",),
                 "latent_image": ("LATENT",),
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "step_change": ("INT", {"default": 980, "min": 0, "max": 1000, "tooltip": "Timestep для перемикання CFG WanHuMo."}),
+                "step_change": ("INT", {"default": 980, "min": 0, "max": 1000,
+                                       "tooltip": "Time-step index to switch WanHuMo CFG behavior (default 980). Determines the moment when the combination formula for scale_a/scale_t changes."}),
             }
         }
 
@@ -170,20 +172,19 @@ class WanHuMo_Sampler:
     CATEGORY = "sampling/WanHuMo"
 
     def sample(self, model, seed, steps, sampler_name, scheduler, positive, negative, latent_image, denoise=1.0, step_change=980):
-        
-        # Створення SimpleLatent-ОБ'ЄКТА для зручного доступу
+        # Create a SimpleLatent object for convenient access if needed
         if isinstance(latent_image, dict) and "samples" in latent_image:
             latent_obj = SimpleLatent(latent_image)
         else:
             latent_obj = latent_image
 
-        # 1. Підготовка базових даних
+        # 1. Prepare base data
         latent = latent_obj["samples"]
         latent = comfy.sample.fix_empty_latent_channels(model, latent)
         batch_inds = latent_obj.get("batch_index")
         noise = comfy.sample.prepare_noise(latent, seed, batch_inds)
         
-        # 2. Підготовка 4-х типів кондиціонування
+        # 2. Prepare 4 types of conditioning
         c_tia = positive
         c_ti_data = positive[0][1].copy()
         if "audio_embed" in c_ti_data:
@@ -194,12 +195,12 @@ class WanHuMo_Sampler:
         if "reference_latents" in c_neg_null_data:
             ref_latents = c_neg_null_data["reference_latents"]
             if isinstance(ref_latents, list) and len(ref_latents) > 0:
-                 c_neg_null_data["reference_latents"] = [torch.zeros_like(ref_latents[0])]
+                c_neg_null_data["reference_latents"] = [torch.zeros_like(ref_latents[0])]
         c_neg_null = [[negative[0][0], c_neg_null_data]]
         
-        # Выбираем единый источник для scale_a / scale_t:
-        # если wanhumo_conditioning (в c_tia) содержит эти параметры — используем их,
-        # иначе используем жёстко заданные дефолты.
+        # Choose the source for scale_a / scale_t:
+        # if wanhumo_conditioning (in c_tia) includes these params — use them,
+        # otherwise fall back to defaults.
         DEFAULT_SCALE_A = 5.5
         DEFAULT_SCALE_T = 5.0
         if isinstance(c_tia, list) and len(c_tia) > 0 and isinstance(c_tia[0][1], dict):
@@ -210,20 +211,20 @@ class WanHuMo_Sampler:
             effective_scale_a = DEFAULT_SCALE_A
             effective_scale_t = DEFAULT_SCALE_T
         
-        # 3. СТВОРЕННЯ ОБГОРТКИ МОДЕЛІ
+        # 3. Create model wrapper
         wrapped_model = WanHuMo_Model_Wrapper(
             model, 
             c_tia, c_ti, c_neg, c_neg_null, effective_scale_a, effective_scale_t, step_change
         )
         
-        # 4. Обробка noise_mask та callback
+        # 4. Handle noise_mask and prepare callback
         noise_mask = None
         if isinstance(latent_image, dict):
             noise_mask = latent_image.get("noise_mask", None)
         callback = latent_preview.prepare_callback(wrapped_model, steps)
         
-        # 5. ВИКЛИК ГОЛОВНОЇ ФУНКЦІЇ СЕМПЛІНГУ
-        # (не передаём обёртку — передаём собственно тензор latent)
+        # 5. Call main sampling function
+        # (pass the tensor latent itself, not the wrapper)
         # latent_dict = LatentWrapper({"samples": latent})
         # if noise_mask is not None:
         #     latent_dict["noise_mask"] = noise_mask
@@ -237,7 +238,7 @@ class WanHuMo_Sampler:
             scheduler, 
             c_tia, 
             c_neg, 
-            latent,       # Передача самóго тензора latent
+            latent,       # Transfer of the latent tensor itself
             denoise=denoise, 
             disable_noise=False, 
             force_full_denoise=False, 
@@ -246,7 +247,7 @@ class WanHuMo_Sampler:
             seed=seed,
         )
 
-        # 6. Формування виходу
+        # 6. Build output
         out = {}
         if isinstance(latent_image, dict):
             out.update(latent_image)
