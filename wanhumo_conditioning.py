@@ -45,7 +45,11 @@ class WanHuMo_Conditioning:
             ref_image = comfy.utils.common_upscale(ref_image[:1].movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
             ref_latent = vae.encode(ref_image[:, :, :, :3])
             positive = node_helpers.conditioning_set_values(positive, {"reference_latents": [ref_latent]}, append=True)
-            negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [torch.zeros_like(ref_latent)]}, append=True)
+            try:
+                neg_ref = ref_latent.clone() if isinstance(ref_latent, torch.Tensor) else ref_latent
+            except Exception:
+                neg_ref = ref_latent
+            negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [neg_ref]}, append=True)
         else:
             zero_latent = torch.zeros([batch_size, 16, 1, height // 8, width // 8], device=comfy.model_management.intermediate_device())
             positive = node_helpers.conditioning_set_values(positive, {"reference_latents": [zero_latent]}, append=True)
@@ -64,20 +68,21 @@ class WanHuMo_Conditioning:
             feat4 = linear_interpolation(audio_emb[:, :, 32], 50, 25)
             audio_emb = torch.stack([feat0, feat1, feat2, feat3, feat4], dim=2)[0]  # [T, 5, 1280]
             audio_emb, _ = get_audio_emb_window(audio_emb, length, frame0_idx=0)
-
+            dev = comfy.model_management.intermediate_device()
+            audio_emb = audio_emb.to(dev)
             audio_emb = audio_emb.unsqueeze(0)
-            audio_emb_neg = torch.zeros_like(audio_emb)
+            audio_emb_neg = torch.zeros_like(audio_emb, device=dev)
             
             positive = node_helpers.conditioning_set_values(positive, {"audio_embed": audio_emb})
             negative = node_helpers.conditioning_set_values(negative, {"audio_embed": audio_emb_neg})
         else:
-            zero_audio = torch.zeros([batch_size, latent_t + 1, 8, 5, 1280], device=comfy.model_management.intermediate_device())
+            zero_audio = torch.zeros([batch_size, latent_t + 1, 5, 1280], device=comfy.model_management.intermediate_device())
             positive = node_helpers.conditioning_set_values(positive, {"audio_embed": zero_audio})
             negative = node_helpers.conditioning_set_values(negative, {"audio_embed": zero_audio})
             
         # Add scale_a and scale_t (pass into conditioning)
-        positive = node_helpers.conditioning_set_values(positive, {"scale_a": [scale_a], "scale_t": [scale_t]}, append=True)
-        negative = node_helpers.conditioning_set_values(negative, {"scale_a": [scale_a], "scale_t": [scale_t]}, append=True)
+        positive = node_helpers.conditioning_set_values(positive, {"scale_a": scale_a, "scale_t": scale_t}, append=True)
+        negative = node_helpers.conditioning_set_values(negative, {"scale_a": scale_a, "scale_t": scale_t}, append=True)
         
         out_latent = {}
         out_latent["samples"] = latent
